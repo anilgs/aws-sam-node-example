@@ -6,27 +6,23 @@ Parameters:
   AppName:
     Type: String
     Description: Name of application (no spaces). Value must be globally unique
-    Default: example
+    Default: linkage
   Environment:
     Type: String
     Description: Name of application (no spaces). Value must be globally unique
     Default: dev
   IdentityRoleARN:
     Type: AWS::SSM::Parameter::Value<String>
-    Description: Identity lambda Role ARN
-    Default: /dev/example/identity_role_arn
-  UserRoleARN:
+    Description: Identity Authorizer lambda Role ARN
+    Default: /dev/linkage/identity_authorize_role_arn
+  RecruitmentRequestsRoleARN:
     Type: AWS::SSM::Parameter::Value<String>
-    Description: User lambda Role ARN
-    Default: /dev/example/user_role_arn
-  UserReceiverRoleARN:
-    Type: AWS::SSM::Parameter::Value<String>
-    Description: User receiver lambda Role ARN
-    Default: /dev/example/user_role_arn
+    Description: Recruitment Requests lambda Role ARN
+    Default: /dev/linkage/recruitment_requests_role_arn
   SNSTopicARN:
     Type: AWS::SSM::Parameter::Value<String>
     Description: SNS Topic ARN for UserFunction to publish messages on SNS
-    Default: /dev/example/sns_topic_arn
+    Default: /dev/linkage/sns_topic_arn
   DebugSampleRate:
     Type: Number
     Description: Percentage of debug logging printed to CloudWatch on Production environment
@@ -35,25 +31,14 @@ Parameters:
     Type: String
     Description: Sets the Canary deployment configuration, e.g. LambdaAllAtOnce, LambdaCanary10Percent5Minutes, LambdaLinear10PercentEvery1Minute, etc. See https://docs.aws.amazon.com/codedeploy/latest/userguide/deployment-configurations.html
     Default: Canary10Percent5Minutes
-  CognitoUserPoolClientID:
-    Type: AWS::SSM::Parameter::Value<String>
-    Default: /dev/example/cognito_user_pool_client_id
-  CognitoUserPoolID:
-    Type: AWS::SSM::Parameter::Value<String>
-    Default: /dev/example/cognito_identity_pool_id
-  CognitoUserPoolARN:
-    Type: AWS::SSM::Parameter::Value<String>
-    Default: /dev/example/cognito_user_pool_arn
   APITimeout:
     Type: Number
     Description: Sets the timeout in millis for all API endpoints
     Default: 4000
 
 Globals:
-  Api:
-    OpenApiVersion: 3.0.1
   Function:
-    Runtime: nodejs12.x
+    Runtime: python3.7
     Timeout: 4
     ReservedConcurrentExecutions: 10
     MemorySize: 256
@@ -72,6 +57,11 @@ Resources:
   # API Gateway
   Api:
     Type: AWS::Serverless::Api
+    Cors: # https://awslabs.github.io/aws-lambda-powertools-python/latest/core/event_handler/api_gateway/#cors
+        # AllowOrigin: "'https://example.com'"
+        AllowOrigin: "'*'"  # Dev only
+        AllowHeaders: "'Content-Type,Authorization,X-Amz-Date'"
+        MaxAge: "'300'"
     Properties:
       Name:
         Fn::Sub: ${Environment}-${AppName}-api
@@ -86,11 +76,16 @@ Resources:
         MetricsEnabled: true
         ThrottlingBurstLimit: 10
         ThrottlingRateLimit: 20
-      DefinitionBody:
-        Fn::Transform:
-          Name: AWS::Include
-          Parameters:
-            Location: api.yaml
+      Auth:
+        Authorizers:
+          BasicAuthorizer:
+            FunctionPayloadType: TOKEN
+            FunctionArn: !ImportValue IdentityAuthorizeFunctionArn
+            Identity:
+              Header: Authorization
+              ValidationExpression: ^[Bb]earer [-0-9a-zA-z\.]*$
+              ReauthorizeEvery: 0
+        DefaultAuthorizer: BasicAuthorizer
       Tags:
         Environment:
           Ref: Environment
@@ -98,45 +93,57 @@ Resources:
           Ref: AppName
 
   # Lambda Functions
-  IdentityFunction:
+  IdentityAuthorizeFunction:
     Type: AWS::Serverless::Function
     Properties:
       FunctionName:
-        Fn::Sub: ${Environment}-${AppName}-identity
+        Fn::Sub: ${Environment}-${AppName}-identity-authorize
       Description: Provides all Cognito functions through 4 API Rest calls
       CodeUri: src/
-      Handler: identity/app.lambdaHandler
+      Handler: identity_authorize/operations/customAuthorizer.lambdaHandler
+      Layers:
+        - !Ref LambdaLayer
+      Events:
+        IdentityAuthorize:
+          Type: HttpApi # More info about API Event Source: https://github.com/awslabs/serverless-application-model/blob/master/versions/2016-10-31.md#api
+          Properties:
+            Path: /api/v1/identity/authorize
+            Method: post
       Role:
-        Ref: IdentityRoleARN
+        Ref: IdentityAuthorizeRoleARN
       DeploymentPreference:
         Type: 
           Ref: LambdaCanaryType
         Alarms:
-        - Ref: IdentityCanaryErrorsAlarm
+        - Ref: IdentityAuthorizeCanaryErrorsAlarm
       Environment:
         Variables:
-          COGNITO_USER_POOL_CLIENT_ID:
-            Ref: CognitoUserPoolClientID
-          COGNITO_USER_POOL_ID:
-            Ref: CognitoUserPoolID
           DEBUG_SAMPLE_RATE:
             Ref: DebugSampleRate
 
-  UserFunction:
+  RecruitmentRequestsFunction:
     Type: AWS::Serverless::Function
     Properties:
       FunctionName:
-        Fn::Sub: ${Environment}-${AppName}-user
-      Description: Provides all User functions
+        Fn::Sub: ${Environment}-${AppName}-recruitment-requests
+      Description: Provides all Recruitment request related functions
       CodeUri: src/
-      Handler: user/app.lambdaHandler
+      Handler: recruitment_requests/operations/getRecruitmentRequests.lambdaHandler
+      Layers:
+        - !Ref LambdaLayer
+      Events:
+        IdentityAuthorize:
+          Type: HttpApi # More info about API Event Source: https://github.com/awslabs/serverless-application-model/blob/master/versions/2016-10-31.md#api
+          Properties:
+            Path: /api/v1/recruitment/requests
+            Method: get
       Role:
-        Ref: UserRoleARN
+        Ref: RecruitmentRequestsRoleARN
       DeploymentPreference:
         Type:
           Ref: LambdaCanaryType
         Alarms:
-        - Ref: UserCanaryErrorsAlarm
+        - Ref: RecruitmentRequestsCanaryErrorsAlarm
       Environment:
         Variables:
           DEBUG_SAMPLE_RATE:
@@ -144,26 +151,7 @@ Resources:
           SNS_TOPIC:
             Ref: SNSTopicARN
 
-  UserReceiverFunction:
-    Type: AWS::Serverless::Function
-    Properties:
-      FunctionName:
-        Fn::Sub: ${Environment}-${AppName}-user-receiver
-      Description: Integrated with SNS
-      CodeUri: src/
-      Handler: user_receiver/app.lambdaHandler
-      Role:
-        Ref: UserReceiverRoleARN
-      DeploymentPreference:
-        Type:
-          Ref: LambdaCanaryType
-        Alarms:
-        - Ref: UserReceiverCanaryErrorsAlarm
-      Environment:
-        Variables:
-          DEBUG_SAMPLE_RATE:
-            Ref: DebugSampleRate
-
+  
   # Lambda Layer
   LambdaLayer:
     Type: AWS::Serverless::LayerVersion
@@ -172,17 +160,17 @@ Resources:
         Fn::Sub: ${Environment}-${AppName}-layer
       Description:
         Fn::Sub: Lambda layer for ${Environment}-${AppName}-layer application
-      ContentUri: dependencies
+      ContentUri: ./python/lib/python3.7/site-packages/
       CompatibleRuntimes:
-      - nodejs12.x
+        - python3.7
       RetentionPolicy: Retain
   
   # CloudWatch Alarms
-  IdentityCanaryErrorsAlarm:
+  IdentityAuthorizeCanaryErrorsAlarm:
     Type: AWS::CloudWatch::Alarm
     Properties:
       AlarmName: 
-        Fn::Sub: ${Environment}-${AppName}-identity-canary-alarm
+        Fn::Sub: ${Environment}-${AppName}-identity-authorize-canary-alarm
       AlarmDescription: Identity Lambda function canary errors
       ComparisonOperator: GreaterThanThreshold
       EvaluationPeriods: 2
@@ -194,21 +182,21 @@ Resources:
       Dimensions:
         - Name: Resource
           Value:
-            Fn::Sub: ${IdentityFunction}:live
+            Fn::Sub: ${IdentityAuthorizeFunction}:live
         - Name: FunctionName
           Value: 
-            Ref: IdentityFunction
+            Ref: IdentityAuthorizeFunction
         - Name: ExecutedVersion
           Value:
             Fn::GetAtt:
-            - IdentityFunction
+            - IdentityAuthorizeFunction
             - Version
             - Version
-  UserCanaryErrorsAlarm:
+  RecruitmentRequestsCanaryErrorsAlarm:
     Type: AWS::CloudWatch::Alarm
     Properties:
       AlarmName: 
-        Fn::Sub: ${Environment}-${AppName}-user-canary-alarm
+        Fn::Sub: ${Environment}-${AppName}-recruitment-requests-canary-alarm
       AlarmDescription: User Lambda function canary errors
       ComparisonOperator: GreaterThanThreshold
       EvaluationPeriods: 2
@@ -220,42 +208,17 @@ Resources:
       Dimensions:
         - Name: Resource
           Value:
-            Fn::Sub: ${UserFunction}:live
+            Fn::Sub: ${RecruitmentRequestsFunction}:live
         - Name: FunctionName
           Value: 
-            Ref: UserFunction
+            Ref: RecruitmentRequestsFunction
         - Name: ExecutedVersion
           Value:
             Fn::GetAtt:
-            - UserFunction
+            - RecruitmentRequestsFunction
             - Version
             - Version
-  UserReceiverCanaryErrorsAlarm:
-    Type: AWS::CloudWatch::Alarm
-    Properties:
-      AlarmName: 
-        Fn::Sub: ${Environment}-${AppName}-user-receiver-canary-alarm
-      AlarmDescription: UserReceiver Lambda function canary errors
-      ComparisonOperator: GreaterThanThreshold
-      EvaluationPeriods: 2
-      MetricName: Errors
-      Namespace: AWS/Lambda
-      Period: 60
-      Statistic: Sum
-      Threshold: 0
-      Dimensions:
-        - Name: Resource
-          Value:
-            Fn::Sub: ${UserReceiverFunction}:live
-        - Name: FunctionName
-          Value: 
-            Ref: UserReceiverFunction
-        - Name: ExecutedVersion
-          Value:
-            Fn::GetAtt:
-            - UserReceiverFunction
-            - Version
-            - Version
+  
 
 Outputs:
   ApiID:
@@ -263,24 +226,21 @@ Outputs:
     Value:
       Ref: Api
   ApiURL:
-    Description: API Gateway endpoint URL for Prod stage for Hello World function
+    Description: API Gateway endpoint URL for Prod stage for function
     Value:
       Fn::Sub: https://${Api}.execute-api.${AWS::Region}.amazonaws.com/dev/
-  IdentityFunction:
-    Description: Identity Lambda Function ARN
+  IdentityAuthorizeFunction:
+    Description: IdentityAuthorize Lambda Function ARN
     Value:
       Fn::GetAtt:
-      - IdentityFunction
+      - IdentityAuthorizeFunction
       - Arn
-  UserFunction:
-    Description: User Lambda Function ARN
+    Export:
+      Name: IdentityAuthorizeFunctionArn
+  RecruitmentRequestsFunction:
+    Description: RecruitmentRequests Lambda Function ARN
     Value:
       Fn::GetAtt:
-      - UserFunction
+      - RecruitmentRequestsFunction
       - Arn
-  UserReceiverFunction:
-    Description: User receiver Lambda Function ARN
-    Value:
-      Fn::GetAtt:
-      - UserReceiverFunction
-      - Arn
+  
